@@ -1143,10 +1143,75 @@ class ClientHandler:
                     f"USER:{target.rating}\r\n")
             return
 
+        if msg_type == "ACC":
+            # swift(s) Aircraft Configuration：机模/灯光/发动机/起落架等部件同步
+            await self._relay_aircraft_config(parts)
+            return
+
         if msg_type == "FP" and len(parts) >= 4:
             # EuroScope 请求某机组飞行计划: 仅发送近 30 分钟提交的, 否则空 $FP
             asyncio.ensure_future(self._reply_fp_request(parts[3]))
             return
+
+    # ---- swift ACC（Aircraft Configuration）转发 ----
+    # 参考 swift: ClientQueryType::AircraftConfig -> "ACC"
+    # 客户端约 1 次/条件变化时广播，给足突发余量，同时防止放大刷屏
+    _ACC_MAX_PAYLOAD = 8192
+    _ACC_BUCKET_CAPACITY = 30.0
+    _ACC_REFILL_PER_SEC = 5.0
+
+    async def _relay_aircraft_config(self, parts: list):
+        """Route a swift Aircraft Configuration ($CQ ... ACC) packet.
+
+        - target == "@94836"：广播给所有在线机组（客户端自行按距离过滤）
+        - target == 具体呼号：点对点请求/应答，仅转发给目标
+        - payload 可能包含 ':'（JSON），必须从第 4 段重建完整 payload
+        """
+        if not self.client:
+            return
+        target = parts[1]
+        payload = ":".join(parts[3:]).strip() if len(parts) > 3 else ""
+        if not payload:
+            return
+        if len(payload) > self._ACC_MAX_PAYLOAD:
+            logger.warning("ACC payload too long (%d) from %s, dropped",
+                           len(payload), self.callsign)
+            return
+        if not self._acc_take_token():
+            logger.info("ACC rate limited from %s", self.callsign)
+            return
+
+        line = f"$CQ{self.callsign}:{target}:ACC:{payload}\r\n"
+        if target == "@94836":
+            for h in list(self.server.clients.values()):
+                if h is self or not getattr(h, "client", None):
+                    continue
+                if getattr(h, "client_type", 0) != CLIENT_PILOT:
+                    continue
+                try:
+                    await h.send(line)
+                except Exception:
+                    pass
+            return
+        if target.startswith("@"):
+            return
+        target_handler = self.server.get_client(target)
+        if target_handler and getattr(target_handler, "client", None):
+            await target_handler.send(line)
+
+    def _acc_take_token(self) -> bool:
+        """Simple token bucket for ACC relay (burst 30, 5/s refill)."""
+        now = time.time()
+        tokens = getattr(self, "_acc_tokens", self._ACC_BUCKET_CAPACITY)
+        last = getattr(self, "_acc_last", now)
+        tokens = min(self._ACC_BUCKET_CAPACITY,
+                     tokens + (now - last) * self._ACC_REFILL_PER_SEC)
+        self._acc_last = now
+        if tokens < 1.0:
+            self._acc_tokens = tokens
+            return False
+        self._acc_tokens = tokens - 1.0
+        return True
 
     async def _reply_fp_request(self, target_callsign):
         """响应 $CQ FP 请求: 发送该机组近 30 分钟提交的飞行计划, 否则空 $FP。"""
