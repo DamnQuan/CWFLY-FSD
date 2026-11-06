@@ -15,6 +15,12 @@ DEFAULT_CONFIG = {
         "certificates": "cert.txt",
         "whazzup": "whazzup.txt",
         "maxclients": "500",
+        # 每 IP 并发连接上限（0 = 不限制）。安全(2026-11-07 审计 P1-9)
+        "maxclientsperip": "8",
+        # 认证前超时(秒)：连接后 N 秒内未完成登录即断开（0 = 用协议默认值）
+        "preauthtimeout": "15",
+        # server port(3011) 绑定地址；默认仅本机
+        "server_bind": "127.0.0.1",
         "email": "fsd@localhost",
         "serverident": "",
         "servername": "FSD Python Server",
@@ -121,6 +127,27 @@ class Config:
     @property
     def max_clients(self) -> int:
         return self.getint("system", "maxclients", 500)
+
+    @property
+    def max_clients_per_ip(self) -> int:
+        """每 IP 并发连接上限（0 = 不限制）。安全(2026-11-07 审计 P1-9)。"""
+        return self.getint("system", "maxclientsperip", 8)
+
+    @property
+    def preauth_timeout(self) -> float:
+        """认证前超时(秒)；0 表示使用协议默认值 PREAUTH_TIMEOUT。"""
+        val = self.get("system", "preauthtimeout")
+        if val is None:
+            return 0.0
+        try:
+            return max(0.0, float(val))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def server_bind(self) -> str:
+        """server port(3011) 绑定地址，默认仅 127.0.0.1。"""
+        return self.get("system", "server_bind", "127.0.0.1")
 
     @property
     def allow_from(self) -> list:

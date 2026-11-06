@@ -10,11 +10,21 @@ import time
 from typing import Optional
 
 from protocol import *
+from protocol import (sanitize_field, sanitize_realname, is_valid_callsign,
+                     line_length_limit, redact_line)
 from certificate import generate_challenge
 from auth import check_login, check_login_challenge
+from ratelimit import TokenBucket
 import db
 
 logger = logging.getLogger("fsd.client")
+
+# 本轮对外暴露的统一清洗入口（审计 P1-10 要求以 _sanitize_field 名义复用）
+_sanitize_field = sanitize_field
+_sanitize_realname = sanitize_realname
+
+# 缺省认证前超时（protocol.PREAUTH_TIMEOUT 可由环境变量/配置覆盖）
+_DEFAULT_PREAUTH_TIMEOUT = PREAUTH_TIMEOUT
 
 # 命令最小字段数守卫（移植自 SimpleFSD CommandRequirements；与各 handler 现有校验保持一致，
 # 只做"字段数不足即拒绝"防止半截报文进入解析，不改变正常路径行为，也不致命断开）
@@ -177,6 +187,11 @@ class ClientHandler:
         self._closed = False
 
         self.peer = writer.get_extra_info("peername", ("unknown", 0))
+        # 连接建立时刻 / 认证前超时（安全 2026-11-07 审计 P1-9）
+        self.connected_at = time.time()
+        self._oversize_lines = 0
+        self._rate_limited = 0
+        self._buckets: dict = {}
 
         # 保活监测（修复 2026-10-16）：记录最后一次收到数据的时刻，
         # 供服务端主动 $PI 探测与「静默客户端」诊断使用
@@ -184,6 +199,77 @@ class ClientHandler:
         self.last_pong_at = 0.0
         self.ping_sent_at = 0.0
         self.ping_missed = 0
+
+    # ---------------- 限流 / 投递 / 长度（安全 2026-11-07 审计 P1-9/P1-11） ----------------
+
+    def _bucket(self, name: str) -> TokenBucket:
+        """按类别取（或惰性创建）本连接的令牌桶。"""
+        bucket = self._buckets.get(name)
+        if bucket is None:
+            capacity, refill = RATE_LIMITS.get(name, (60.0, 10.0))
+            bucket = TokenBucket(capacity, refill)
+            self._buckets[name] = bucket
+        return bucket
+
+    def _take(self, name: str) -> bool:
+        """尝试消耗一个该类报文的令牌；超限返回 False（调用方丢弃报文）。"""
+        if self._bucket(name).take():
+            return True
+        self._rate_limited = getattr(self, "_rate_limited", 0) + 1
+        # 只在首次/每 50 次打日志，避免限流本身刷日志
+        if self._rate_limited == 1 or self._rate_limited % 50 == 0:
+            logger.warning(
+                f"Rate limited ({name}): {self.callsign or '?'} "
+                f"cid={self.cid or '?'} peer={self.peer} "
+                f"dropped={self._rate_limited}")
+        return False
+
+    def _fire(self, coro):
+        """有界投递一个协程（广播/多播）。
+
+        优先使用 server 的有界调度器（FSDServer.spawn）；离线测试里的 FakeServer
+        没有该属性时回退到 asyncio.ensure_future，保持旧行为。
+        """
+        spawn = getattr(self.server, "spawn", None)
+        if spawn is not None:
+            try:
+                return spawn(coro)
+            except Exception:
+                pass
+        try:
+            return asyncio.ensure_future(coro)
+        except Exception:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            return None
+
+    def _line_length_ok(self, line: str) -> bool:
+        """单行长度上限校验（审计 P1-11/P2-25：MAX_LINE_LENGTH 此前从未生效）。
+
+        超长行丢弃；累计超过 ``MAX_OVERSIZE_LINES`` 次即判定恶意并断开。
+        """
+        limit = line_length_limit(line)
+        length = len(line)
+        if length <= limit:
+            return True
+        self._oversize_lines = getattr(self, "_oversize_lines", 0) + 1
+        logger.warning(
+            f"Oversize line dropped: {self.callsign or '?'} len={length} "
+            f"limit={limit} count={self._oversize_lines} peer={self.peer}")
+        if self._oversize_lines >= MAX_OVERSIZE_LINES:
+            self._close_reason = "line_too_long"
+            self._closed = True
+        return False
+
+    def _auth_timeout(self) -> float:
+        """认证前超时（秒）：配置优先，其次环境变量/协议默认值。"""
+        try:
+            configured = self.server.config.preauth_timeout
+        except Exception:
+            configured = 0.0
+        return configured if configured and configured > 0 else _DEFAULT_PREAUTH_TIMEOUT
 
     def idle_seconds(self) -> float:
         """距上次收到该客户端数据的秒数（保活/诊断用）。"""
@@ -290,8 +376,11 @@ class ClientHandler:
             await self.send(f"$CH{self.challenge}\r\n")
 
             while not self._closed:
+                # 安全(2026-11-07 审计 P1-9)：认证前使用较短的 PREAUTH_TIMEOUT，
+                # 防止「连上不登录」的慢速连接长期占用 FD/内存。认证后恢复长超时。
+                timeout = CLIENT_TIMEOUT if self.client else self._auth_timeout()
                 data = await asyncio.wait_for(
-                    self.reader.read(4096), timeout=CLIENT_TIMEOUT)
+                    self.reader.read(4096), timeout=timeout)
                 if not data:
                     close_reason = "peer_closed"   # 对端 FIN：客户端主动断开或网络掉线
                     break
@@ -304,11 +393,16 @@ class ClientHandler:
 
                 while "\r\n" in self._buffer:
                     line, self._buffer = self._buffer.split("\r\n", 1)
-                    await self._process_line(line.strip())
+                    line = line.strip()
+                    # 安全(2026-11-07 审计 P1-11/P2-25)：单行长度上限真正生效
+                    if not self._line_length_ok(line):
+                        continue
+                    await self._process_line(line)
 
         except asyncio.TimeoutError:
-            close_reason = "read_timeout"
-            logger.info(f"Client read timeout: {self.callsign or '?'} cid={self.cid or '?'} peer={self.peer}")
+            close_reason = "read_timeout" if self.client else "preauth_timeout"
+            logger.info(f"Client read timeout: {self.callsign or '?'} cid={self.cid or '?'} "
+                        f"peer={self.peer} authed={bool(self.client)}")
         except ConnectionResetError:
             close_reason = "connection_reset"      # 对端 RST
             logger.info(f"Client connection reset: {self.callsign or '?'} cid={self.cid or '?'} peer={self.peer}")
@@ -321,11 +415,48 @@ class ClientHandler:
             await self._disconnect(close_reason)
 
     async def send(self, data: str):
-        """Send raw data to the client."""
+        """Send raw data to the client.
+
+        安全(2026-11-07 审计 P1-11)：写缓冲有高水位 + drain 超时，超限即判定为
+        慢客户端并断开（此前写缓冲无上限，慢客户端会无限堆积内存）。
+        """
         try:
-            self.writer.write(data.encode())
-            await self.writer.drain()
+            writer = self.writer
+            if writer is None:
+                self._closed = True
+                return
+            transport = getattr(writer, "transport", None)
+            buffered = 0
+            if transport is not None and hasattr(transport, "get_write_buffer_size"):
+                try:
+                    buffered = int(transport.get_write_buffer_size())
+                except Exception:
+                    buffered = 0
+            if buffered > WRITE_BUFFER_HIGH_WATER:
+                logger.warning(
+                    f"Slow client dropped: {self.callsign or '?'} cid={self.cid or '?'} "
+                    f"peer={self.peer} write_buffer={buffered} > {WRITE_BUFFER_HIGH_WATER}")
+                self._close_reason = "write_buffer_overflow"
+                self._closed = True
+                if transport is not None and hasattr(transport, "abort"):
+                    try:
+                        transport.abort()
+                    except Exception:
+                        pass
+                return
+            writer.write(data.encode())
+            await asyncio.wait_for(writer.drain(), timeout=WRITE_DRAIN_TIMEOUT)
             self.server.stats["packets_sent"] += 1
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Slow client dropped (drain timeout): {self.callsign or '?'} "
+                f"cid={self.cid or '?'} peer={self.peer}")
+            self._close_reason = "write_drain_timeout"
+            self._closed = True
+            try:
+                self.writer.transport.abort()
+            except Exception:
+                pass
         except Exception:
             self._closed = True
 
@@ -374,9 +505,14 @@ class ClientHandler:
             return
 
         # 抓包调试：FSD_RAW_LOG=1 时打印所有原始行（含未识别命令）
+        # 安全(2026-11-07 审计 P2-25)：口令/挑战响应一律打码，日志里不再出现明文口令
         import os as _os
         if _os.environ.get("FSD_RAW_LOG"):
-            logger.info(f"[RAW] {line!r} from {self.callsign or '?'}")
+            logger.info(f"[RAW] {redact_line(line)!r} from {self.callsign or '?'}")
+
+        # 安全(2026-11-07 审计 P1-9)：全局限速闸门，正常客户端每秒仅个位数报文
+        if not self._take("line"):
+            return
 
         self.server.stats["packets_received"] += 1
         self.last_data_at = time.time()   # 保活监测：记录最后收包时刻
@@ -475,11 +611,15 @@ class ClientHandler:
         return None
 
     def _callsign_ok(self, name: str) -> int:
-        """Validate a callsign. Returns ERR_OK or error code."""
-        if len(name) < 2 or len(name) > CALLSIGN_BYTES:
+        """Validate a callsign. Returns ERR_OK or error code.
+
+        安全(2026-11-07 审计 P1-10)：改用白名单 ``^[A-Za-z0-9][A-Za-z0-9_.-]{1,11}$``，
+        显式拒绝 ``\\r``/``\\n``/``:``/``<``/``>`` 等会伪造报文的字符
+        （旧实现只挡了 ``!@#$%*:& \\t``，漏掉 CR/LF 与尖括号）。
+        """
+        if not name or len(name) < 2 or len(name) > CALLSIGN_BYTES:
             return ERR_CSINVALID
-        invalid_chars = set("!@#$%*:& \t")
-        if any(c in invalid_chars for c in name):
+        if not is_valid_callsign(name):
             return ERR_CSINVALID
         if name in self.server.clients:
             return ERR_CSINUSE
@@ -496,11 +636,22 @@ class ClientHandler:
         if len(parts) < 8:
             await self.send_error(ERR_SYNTAX)
             return
+        # 安全(2026-11-07 审计 P1-9)：认证报文限速，防在线爆破
+        if not self._take("auth"):
+            await self._kick(ERR_CIDINVALID)
+            return
 
         callsign, client_type, cid = parts[0], parts[1], parts[2]
         hmac_response, req_rating, revision = parts[3], parts[4], parts[5]
         realname = parts[6] if len(parts) > 6 else ""
         simtype = parts[7] if len(parts) > 7 else "0"
+
+        # 安全(2026-11-07 审计 P1-10)：呼号/实名/CID 先清洗再校验，
+        # 防止把 CR/LF/':' 带进后续所有出站广播（#AA/#AP/$FP）。
+        callsign = sanitize_field(callsign, CALLSIGN_BYTES)
+        realname = sanitize_realname(realname)
+        cid = sanitize_field(cid, MAX_CID_LENGTH)
+        hmac_response = sanitize_field(hmac_response, 128)
 
         # Validate
         err = self._callsign_ok(callsign)
@@ -511,8 +662,12 @@ class ClientHandler:
             await self._kick(ERR_REVISION)
             return
 
-        client_type = int(client_type)
-        req = int(req_rating) if req_rating else 1
+        try:
+            client_type = int(client_type)
+            req = int(req_rating) if req_rating else 1
+        except (TypeError, ValueError):
+            await self._kick(ERR_SYNTAX)
+            return
         # 安全(2026-10-25 审计 P2-2): 客户端类型自报必须合法; ATC 需 fsdLevel>=2
         if client_type not in (CLIENT_PILOT, CLIENT_ATC):
             await self._kick(ERR_SYNTAX)
@@ -556,7 +711,7 @@ class ClientHandler:
         self.callsign = callsign
         self.client_type = client_type
         self.client = Client(cid, callsign, client_type, level,
-                             realname, revision, int(simtype))
+                             realname, revision, self._safe_int(simtype))
         self.server.register_client(self)
 
         self.server.stats["auth_success"] += 1
@@ -566,16 +721,20 @@ class ClientHandler:
 
     @staticmethod
     def _fallback_realname(realname: str, cid: str) -> str:
-        """姓名兜底：客户端 Real Name 为空、或直接填了 CID 时，改用平台用户名。"""
+        """姓名兜底：客户端 Real Name 为空时改用平台用户名。
+
+        安全(2026-11-07 审计 P1-10)：两条来源都做统一清洗（去 CR/LF/':'/'<>'，
+        长度 ≤64），平台用户名同样不可信。
+        """
         # 以客户端（EuroScope）填写的 Real Name 为准；仅当为空时才用平台用户名兜底
         if realname:
-            return realname
+            return sanitize_realname(realname)
         try:
             from db import get_username_by_cid
             name = get_username_by_cid(cid)
-            return name or realname
+            return sanitize_realname(name) if name else ""
         except Exception:
-            return realname
+            return ""
 
     async def _handle_add_atc(self, parts: list):
         """Handle #AA - Add ATC (legacy plaintext auth).
@@ -588,8 +747,20 @@ class ClientHandler:
         if len(parts) < 7:
             await self.send_error(ERR_SYNTAX)
             return
+        # 安全(2026-11-07 审计 P1-9)：认证报文限速，防在线爆破
+        if not self._take("auth"):
+            await self._kick(ERR_CIDINVALID)
+            return
 
         callsign, _, realname, cid, password = parts[0], parts[1], parts[2], parts[3], parts[4]
+        # 安全(2026-11-07 审计 P1-10)：呼号/实名/CID 清洗后再进协议与广播
+        callsign = sanitize_field(callsign, CALLSIGN_BYTES)
+        realname = sanitize_realname(realname)
+        cid = sanitize_field(cid, MAX_CID_LENGTH)
+        # 口令不做字符清洗（会破坏口令），只限长防止超长输入拖慢 SHA-256
+        if not isinstance(password, str) or len(password) > 128:
+            await self._kick(ERR_SYNTAX)
+            return
         try:
             logger.info(
                 "#AA layout: fields=%d f0=%r f1=%r f2=%r f5=%r f6=%r"
@@ -609,7 +780,11 @@ class ClientHandler:
             await self._kick(ERR_REVISION)
             return
 
-        req = int(req_rating) if req_rating else 1
+        try:
+            req = int(req_rating) if req_rating else 1
+        except (TypeError, ValueError):
+            await self._kick(ERR_SYNTAX)
+            return
         ok, max_lvl = check_login(self.server.certs, cid, password)
 
         if not ok:
@@ -655,9 +830,22 @@ class ClientHandler:
         if len(parts) < 8:
             await self.send_error(ERR_SYNTAX)
             return
+        # 安全(2026-11-07 审计 P1-9)：认证报文限速，防在线爆破
+        if not self._take("auth"):
+            await self._kick(ERR_CIDINVALID)
+            return
 
         callsign, _, cid, password = parts[0], parts[1], parts[2], parts[3]
         req_rating, revision, simtype, realname = parts[4], parts[5], parts[6], parts[7]
+
+        # 安全(2026-11-07 审计 P1-10)：呼号/实名/CID 清洗后再进协议与广播
+        callsign = sanitize_field(callsign, CALLSIGN_BYTES)
+        realname = sanitize_realname(realname)
+        cid = sanitize_field(cid, MAX_CID_LENGTH)
+        # 口令不做字符清洗（会破坏口令），只限长防止超长输入拖慢 SHA-256
+        if not isinstance(password, str) or len(password) > 128:
+            await self._kick(ERR_SYNTAX)
+            return
 
         err = self._callsign_ok(callsign)
         if err:
@@ -668,7 +856,11 @@ class ClientHandler:
             await self._kick(ERR_REVISION)
             return
 
-        req = int(req_rating) if req_rating else 1
+        try:
+            req = int(req_rating) if req_rating else 1
+        except (TypeError, ValueError):
+            await self._kick(ERR_SYNTAX)
+            return
         ok, max_lvl = check_login(self.server.certs, cid, password)
 
         if not ok:
@@ -697,7 +889,7 @@ class ClientHandler:
         self.callsign = callsign
         self.client_type = CLIENT_PILOT
         self.client = Client(cid, callsign, CLIENT_PILOT, level,
-                             realname, revision, int(simtype))
+                             realname, revision, self._safe_int(simtype))
         self.server.register_client(self)
 
         self.server.stats["auth_success"] += 1
@@ -719,8 +911,11 @@ class ClientHandler:
         """Handle @ - Pilot position update."""
         if not self.client or len(parts) < 10:
             return
+        # 安全(2026-11-07 审计 P1-9)：位置报文限速（每秒最多转发 30 条/突发 120）
+        if not self._take("pos"):
+            return
         try:
-            self.client.ident_flag = parts[0]
+            self.client.ident_flag = sanitize_field(parts[0], 8)
             self.client.transponder = int(parts[2])
             self.client.lat = float(parts[4])
             self.client.lon = float(parts[5])
@@ -786,6 +981,9 @@ class ClientHandler:
         if not self.client or len(parts) < 8:
             return
         if self.client_type != CLIENT_ATC:
+            return
+        # 安全(2026-11-07 审计 P1-9)：位置报文限速
+        if not self._take("pos"):
             return
         try:
             raw_freq = int(parts[1])
@@ -1093,7 +1291,11 @@ class ClientHandler:
         try:
             if parts[1].upper() == "SERVER" and parts[2].upper() == "ATIS" and len(parts) >= 5:
                 if parts[3].upper() == "T":
-                    text = ":".join(parts[4:]).strip()
+                    # 安全(2026-11-07 审计 P1-5/P2-25)：ATIS 仅允许管制员上报，长度上限防伪造/内存占用
+                    if self.client_type != CLIENT_ATC:
+                        logger.warning('ATIS rejected: non-ATC %s cid=%s', self.callsign, self.cid)
+                        return
+                    text = ":".join(parts[4:]).strip()[:2048]
                     if text:
                         # ATIS 分段聚合：EuroScope 会把一条 ATIS 拆成多条 $CR 发送，
                         # 直接覆盖会导致只剩最后一段（曾出现 25 字符 + 9 字符 → 只剩 9 字符）
@@ -1104,9 +1306,9 @@ class ClientHandler:
                             parts_buf = []
                         self._atis_parts = parts_buf
                         self._atis_last_ts = now_ts
-                        if text not in parts_buf:
+                        if text not in parts_buf and len(parts_buf) < 32:
                             parts_buf.append(text)
-                        self.client.atis = "\n".join(parts_buf)
+                        self.client.atis = "\n".join(parts_buf)[:2048]
                         logger.info(
                             f"ATIS received: {self.callsign} ({len(text)} chars, "
                             f"segments={len(parts_buf)}, total={len(self.client.atis)})")

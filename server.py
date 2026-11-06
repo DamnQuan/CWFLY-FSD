@@ -7,7 +7,9 @@ from typing import Optional
 
 from config import Config
 from protocol import *
+from protocol import ERR_SERVFULL
 from certificate import CertificateStore, Certificate, generate_challenge
+from ratelimit import ConnectionLimiter
 from client_handler import ClientHandler, Client, FlightPlan
 from server_link import ServerLinkManager
 from management import ManagementConsole
@@ -64,6 +66,13 @@ class FSDServer:
         self.server_links = ServerLinkManager(self)
         self.weather = WeatherManager(self)
         self.whazzup = WhazzupGenerator(self)
+        # 安全(2026-11-07 审计 P1-9)：全局连接上限 + 每 IP 并发上限
+        try:
+            self.connection_limiter = ConnectionLimiter(
+                self.config.max_clients, self.config.max_clients_per_ip)
+        except Exception:
+            self.connection_limiter = ConnectionLimiter(500, 8)
+
 
         # State
         self.clients: dict[str, ClientHandler] = {}  # callsign -> handler
@@ -121,7 +130,7 @@ class FSDServer:
             admin_pw = secrets.token_urlsafe(12)
             cert = Certificate("000000", admin_pw, LEV_ADMINISTRATOR)
             self.certs.add(cert)
-            self.certs.save(config.cert_file)
+            self.certs.save_public(config.cert_file)
             # 安全(2026-10-25 审计 P1-1): 管理密码不进日志/stdout, 写一次性文件(600)
             pw_file = os.path.join(os.path.dirname(config.cert_file) or '.', '.fsd-admin-000000')
             with open(pw_file, 'w') as f:
@@ -361,10 +370,33 @@ class FSDServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
-        """Handle a new client connection (port 6809)."""
-        handler = ClientHandler(self, reader, writer, is_server=False)
-        self.stats["connections"] += 1
-        await handler.run()
+        """Handle a new client connection (port 6809).
+
+        安全(2026-11-07 审计 P1-9)：进入协议处理前先做全局/每 IP 并发准入；
+        超限直接回 $ER 并断开（不分配 ClientHandler，避免 DoS 时内存增长）。
+        """
+        peer = writer.get_extra_info("peername")
+        ip = peer[0] if peer else "unknown"
+        ok, reason = self.connection_limiter.admit(ip)
+        if not ok:
+            self.stats["connections_rejected"] = self.stats.get("connections_rejected", 0) + 1
+            try:
+                writer.write(
+                    f"$ERserver:server:{ERR_SERVFULL:03d}:{reason}:Server full\r\n".encode())
+                await writer.drain()
+            except Exception:
+                pass
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return
+        try:
+            handler = ClientHandler(self, reader, writer, is_server=False)
+            self.stats["connections"] += 1
+            await handler.run()
+        finally:
+            self.connection_limiter.release(ip)
 
     async def _handle_server(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
