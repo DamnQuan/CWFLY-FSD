@@ -7,12 +7,12 @@ import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import certificate  # noqa: E402
-import protocol  # noqa: E402
-from certificate import Certificate, CertificateStore, _sanitize_cert_row, hash_password  # noqa: E402
-from ratelimit import ConnectionLimiter, TokenBucket  # noqa: E402
-import client_handler  # noqa: E402
-from client_handler import Client, ClientHandler  # noqa: E402
+from fsd import certificate  # noqa: E402  # noqa: E402
+from fsd import protocol  # noqa: E402  # noqa: E402
+from fsd.certificate import Certificate, CertificateStore, _sanitize_cert_row, hash_password  # noqa: E402
+from fsd.ratelimit import ConnectionLimiter, TokenBucket  # noqa: E402
+from fsd import client_handler  # noqa: E402  # noqa: E402
+from fsd.client_handler import Client, ClientHandler  # noqa: E402
 
 PASS, FAIL = [], []
 

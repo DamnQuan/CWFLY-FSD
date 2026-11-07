@@ -9,13 +9,13 @@ import re
 import time
 from typing import Optional
 
-from protocol import *
-from protocol import (sanitize_field, sanitize_realname, is_valid_callsign,
+from fsd.protocol import *
+from fsd.protocol import (sanitize_field, sanitize_realname, is_valid_callsign,
                      line_length_limit, redact_line)
-from certificate import generate_challenge
-from auth import check_login, check_login_challenge
-from ratelimit import TokenBucket
-import db
+from fsd.certificate import generate_challenge
+from fsd.auth import check_login, check_login_challenge
+from fsd.ratelimit import TokenBucket
+from fsd import db
 
 logger = logging.getLogger("fsd.client")
 
@@ -730,7 +730,7 @@ class ClientHandler:
         if realname:
             return sanitize_realname(realname)
         try:
-            from db import get_username_by_cid
+            from fsd.db import get_username_by_cid
             name = get_username_by_cid(cid)
             return sanitize_realname(name) if name else ""
         except Exception:

@@ -20,7 +20,7 @@ import os
 import time
 from typing import Optional
 
-from protocol import LEV_OBSPILOT, LEV_SUSPENDED, LEV_MAX, CERT_LEVEL_NAMES, \
+from fsd.protocol import LEV_OBSPILOT, LEV_SUSPENDED, LEV_MAX, CERT_LEVEL_NAMES, \
     is_valid_cid, MAX_CID_LENGTH
 
 logger = logging.getLogger("fsd.certificate")

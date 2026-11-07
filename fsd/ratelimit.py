@@ -10,7 +10,7 @@
 import asyncio
 import time
 
-from protocol import MAX_INFLIGHT_TASKS
+from fsd.protocol import MAX_INFLIGHT_TASKS
 
 
 class TokenBucket:

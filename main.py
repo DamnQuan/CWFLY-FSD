@@ -24,8 +24,8 @@ import logging
 import os
 import sys
 
-from config import Config
-from server import FSDServer
+from fsd.config import Config
+from fsd.server import FSDServer
 
 
 def setup_logging(debug: bool = False):

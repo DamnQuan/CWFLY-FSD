@@ -10,7 +10,7 @@ import os
 import time
 from typing import Optional
 
-from protocol import CLIENT_ATC, CLIENT_PILOT
+from fsd.protocol import CLIENT_ATC, CLIENT_PILOT
 
 logger = logging.getLogger("fsd.whazzup")
 

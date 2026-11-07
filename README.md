@@ -18,18 +18,28 @@ CWFLY 的 **FSD 协议服务器**，用 Python 3 + asyncio 实现，供 EuroScop
 
 | 文件 | 职责 |
 |---|---|
+```
+CWFLY-FSD/
+├── main.py            # 唯一入口：python main.py [fsd.conf]
+├── fsd/               # 核心包：server / client_handler / protocol / certificate / db / weather ...
+├── config/            # fsd.conf.example / fsd-db.conf.example
+├── tools/             # 运维与诊断脚本（非运行必需）
+├── tests/             # 离线单测 / 回归脚本
+└── docs/              # ACC 协议、部署说明
+```
+
 | `main.py` | 启动入口：加载配置 → 初始化证书/数据库/天气 → 启动各服务 |
-| `server.py` | asyncio 服务器：监听三端口、连接准入、`clients` 注册表、保活、事件循环延迟监控、优雅关闭 |
-| `client_handler.py` | 单客户端的协议状态机：命令分发、位置/计划/消息、在线快照、航迹记录、断线处理 |
-| `protocol.py` | FSD 命令常量、错误码、等级常量 |
-| `certificate.py` | 证书库：SHA-256 口令、`$CH/$SA` 挑战应答校验、MySQL 证书模式与 60s 热加载 |
-| `auth.py` | 认证辅助（白名单/等级等） |
-| `config.py` | 配置解析（`fsd.conf` / `fsd-db.conf`） |
-| `db.py` | MySQL 访问：在线快照、计划落库、在线时长、航迹、审计 |
-| `weather.py` | METAR 多源（aviationweather + VATSIM + 可选 metar-taf）、OurAirports 站点库、`metar.dat` 原子写入 |
-| `whazzup.py` | 周期生成 `whazzup.txt`（供 Little Navmap 等第三方） |
-| `management.py` | 3012 管理控制台：在线列表/踢人/广播/统计 |
-| `server_link.py` | 服务器互联协议 |
+| `fsd/server.py` | asyncio 服务器：监听三端口、连接准入、`clients` 注册表、保活、事件循环延迟监控、优雅关闭 |
+| `fsd/client_handler.py` | 单客户端的协议状态机：命令分发、位置/计划/消息、在线快照、航迹记录、断线处理 |
+| `fsd/protocol.py` | FSD 命令常量、错误码、等级常量 |
+| `fsd/certificate.py` | 证书库：SHA-256 口令、`$CH/$SA` 挑战应答校验、MySQL 证书模式与 60s 热加载 |
+| `fsd/auth.py` | 认证辅助（白名单/等级等） |
+| `fsd/config.py` | 配置解析（`fsd.conf` / `fsd-db.conf`） |
+| `fsd/db.py` | MySQL 访问：在线快照、计划落库、在线时长、航迹、审计 |
+| `fsd/weather.py` | METAR 多源（aviationweather + VATSIM + 可选 metar-taf）、OurAirports 站点库、`metar.dat` 原子写入 |
+| `fsd/whazzup.py` | 周期生成 `whazzup.txt`（供 Little Navmap 等第三方） |
+| `fsd/management.py` | 3012 管理控制台：在线列表/踢人/广播/统计 |
+| `fsd/server_link.py` | 服务器互联协议 |
 | `tests/test_session_reconnect.py` | 会话重连/心跳/视程/ATIS 共 21 项离线断言 |
 
 ---
@@ -81,7 +91,7 @@ CWFLY 的 **FSD 协议服务器**，用 Python 3 + asyncio 实现，供 EuroScop
 - 断开 **< 10 秒** 内重连：静默恢复（保留计划/ATIS/在线时长），不向其他客户端广播上下线（避免网络抖动刷屏）
 - 断开 **≥ 10 秒** 后重连：恢复会话的同时，向其他客户端补发一次 `#DA` + `#AA`（`#DP` + `#AP`），
   机器人 / 第三方客户端据此重新识别为「上线」并播报
-- 阈值：`server.py` 的 `RESUME_ANNOUNCE_MIN = 10.0`（秒），可调整
+- 阈值：`fsd/server.py` 的 `RESUME_ANNOUNCE_MIN = 10.0`（秒），可调整
 
 ### 4）飞行计划锁定
 - 管制 `$AM` 修正后锁定（写入 `FlightPlan.locked` 并广播给所有在线管制）
@@ -146,7 +156,7 @@ password =
 source = download
 ```
 
-> 真实配置不入库：仓库只提交 `fsd.conf.example` / `fsd-db.conf.example`（口令已清空）。
+> 真实配置不入库：仓库只提交 `config/fsd.conf.example` / `fsd-db.conf.example`（口令已清空）。
 
 ---
 
@@ -155,7 +165,7 @@ source = download
 ```bash
 python -m venv .venv && . .venv/Scripts/activate    # Windows
 pip install -r requirements.txt
-cp fsd-db.conf.example fsd-db.conf                   # 或 fsd.conf.example
+cp config/fsd-db.conf.example fsd-db.conf                   # 或 config/fsd.conf.example
 python main.py
 ```
 
@@ -163,8 +173,8 @@ python main.py
 
 ```bash
 python tests/test_session_reconnect.py    # 21 项：重连窗口/心跳/视程最近距离/ATIS/视程点
-python test_bcrypt_login.py               # 口令哈希与登录校验
-python test_port.py                       # 端口连通
+python tools/test_bcrypt_login.py               # 口令哈希与登录校验
+python tools/test_port.py                       # 端口连通
 ```
 
 ---

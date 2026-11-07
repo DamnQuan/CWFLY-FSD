@@ -4,9 +4,9 @@ import asyncio
 import sys
 
 sys.path.insert(0, ".")
-from server import FSDServer  # noqa: E402
-import client_handler  # noqa: E402
-from client_handler import Client  # noqa: E402
+from fsd.server import FSDServer  # noqa: E402
+from fsd import client_handler  # noqa: E402  # noqa: E402
+from fsd.client_handler import Client  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -89,7 +89,7 @@ async def main():
     if getattr(h, "_kicked", False):
         reason = "kicked"
     check("_kicked 时强制 reason=kicked", reason == "kicked")
-    check("kicked 不在可恢复原因中", reason not in __import__("server").RECONNECTABLE_REASONS)
+    check("kicked 不在可恢复原因中", reason not in __import__("fsd.server", fromlist=["x"]).RECONNECTABLE_REASONS)
 
     print()
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

@@ -8,8 +8,8 @@ import logging
 import time
 from typing import Optional
 
-from protocol import *
-from client_handler import Client
+from fsd.protocol import *
+from fsd.client_handler import Client
 
 logger = logging.getLogger("fsd.serverlink")
 
@@ -199,7 +199,7 @@ class ServerLink:
         Password is already SHA-256 hashed for security.
         """
         if len(parts) >= 6:
-            from certificate import Certificate
+            from fsd.certificate import Certificate
             cmd_type = int(parts[0]) if parts[0].isdigit() else CERT_ADD
             cid = parts[1]
             pwd_hash = parts[2]

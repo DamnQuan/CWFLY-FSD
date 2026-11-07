@@ -5,17 +5,17 @@ import logging
 import time
 from typing import Optional
 
-from config import Config
-from protocol import *
-from protocol import ERR_SERVFULL
-from certificate import CertificateStore, Certificate, generate_challenge
-from ratelimit import ConnectionLimiter
-from client_handler import ClientHandler, Client, FlightPlan
-from server_link import ServerLinkManager
-from management import ManagementConsole
-from weather import WeatherManager
-from whazzup import WhazzupGenerator
-import db
+from fsd.config import Config
+from fsd.protocol import *
+from fsd.protocol import ERR_SERVFULL
+from fsd.certificate import CertificateStore, Certificate, generate_challenge
+from fsd.ratelimit import ConnectionLimiter
+from fsd.client_handler import ClientHandler, Client, FlightPlan
+from fsd.server_link import ServerLinkManager
+from fsd.management import ManagementConsole
+from fsd.weather import WeatherManager
+from fsd.whazzup import WhazzupGenerator
+from fsd import db
 
 logger = logging.getLogger("fsd")
 
@@ -401,7 +401,7 @@ class FSDServer:
     async def _handle_server(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
         """Handle a new server connection (port 3011)."""
-        from server_link import ServerLink
+        from fsd.server_link import ServerLink
         link = ServerLink(self, reader, writer)
         await self.server_links.add(link)
 
